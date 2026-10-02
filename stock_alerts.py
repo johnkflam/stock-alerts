@@ -1,40 +1,42 @@
 #!/usr/bin/env python3
 """
-Stock Alert Script - monitors SPACX, GLD, TSLA for 5%+ daily moves.
-Sends alerts via Telegram when threshold is crossed.
+Stock Alert Script
+- SPCX, GLD, TSLA: alert on ±5% daily move
+- S&P 500 (^GSPC):   alert after 3 consecutive down days
 """
 
 import sys
 import json
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Tuple
 import urllib.request
 import urllib.error
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = "8956424241:AAEGRHwoLWlvG-ph4n2OWUcTKmJpy0UEAng"   # Set your Telegram bot token
-TELEGRAM_CHAT_ID   = "8687524205"       # Your Telegram chat ID
-TICKERS            = ["SPCX", "GLD", "TSLA"]
-THRESHOLD          = 5.0                # percent
-CACHE_FILE         = "/home/jlam/.openclaw/workspace/.stock_cache.json"
+TELEGRAM_BOT_TOKEN = "8956424241:AAEGRHwoLWlvG-ph4n2OWUcTKmJpy0UEAng"
+TELEGRAM_CHAT_ID   = "8687524205"
+
+TICKERS_5PCT  = ["SPCX", "GLD", "TSLA"]
+SPX_TICKER    = "^GSPC"
+THRESHOLD     = 5.0          # percent for TICKERS_5PCT
+SPX_CONSECUTIVE_DOWNS = 3    # trigger SPX alert after this many consecutive down days
+
+CACHE_FILE    = "/home/jlam/.openclaw/workspace/.stock_cache.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_telegram_safe_mode():
-    """Detect if we're in a safe execution context for sending messages."""
     import os
     return os.environ.get("OPENCLAW_SAFE_EXEC", "").lower() != "false"
 
+
 def fetch_quote(ticker: str) -> Optional[dict]:
-    """
-    Fetch current price and previous close for `ticker` using Yahoo Finance.
-    Returns dict with `price`, `prev_close`, `change_pct`, or None on failure.
-    """
-    time.sleep(1.5)   # avoid rate-limit bursts between tickers
+    """Fetch price + previous close from Yahoo Finance. Returns None on failure."""
+    time.sleep(1.5)
 
     url = (
         f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        f"?interval=1d&range=5d"
+        f"?interval=1d&range=10d"     # 10d range to ensure we have enough history for SPX
     )
     headers = {
         "User-Agent": (
@@ -60,14 +62,14 @@ def fetch_quote(ticker: str) -> Optional[dict]:
         meta   = result["meta"]
         price  = meta.get("regularMarketPrice") or meta.get("previousClose")
 
-        # previousClose may be absent; derive from closes array
+        # Derive previous close from closes array if meta field is absent
         prev_close = meta.get("previousClose")
         if not prev_close:
             try:
                 closes = result["indicators"]["quote"][0]["close"]
-                closes = [c for c in closes if c is not None]   # filter None
+                closes = [c for c in closes if c is not None]
                 if len(closes) >= 2:
-                    prev_close = closes[-2]   # second-to-last = previous close
+                    prev_close = closes[-2]
                 elif len(closes) == 1:
                     prev_close = closes[0]
             except (KeyError, IndexError):
@@ -78,7 +80,11 @@ def fetch_quote(ticker: str) -> Optional[dict]:
             return None
 
         change_pct = ((price - prev_close) / prev_close) * 100
-        return {"price": round(price, 4), "prev_close": round(prev_close, 4), "change_pct": round(change_pct, 2)}
+        return {
+            "price":      round(price, 4),
+            "prev_close": round(prev_close, 4),
+            "change_pct": round(change_pct, 2),
+        }
 
     except urllib.error.HTTPError as e:
         if e.code == 429:
@@ -105,7 +111,6 @@ def save_cache(cache: dict) -> None:
 
 
 def send_telegram(message: str) -> bool:
-    """Send a message via Telegram bot."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}).encode()
     try:
@@ -117,7 +122,7 @@ def send_telegram(message: str) -> bool:
         return False
 
 
-def format_alert(ticker: str, q: dict) -> str:
+def format_5pct_alert(ticker: str, q: dict) -> str:
     emoji     = "🔴" if q["change_pct"] < 0 else "🟢"
     direction = "DOWN" if q["change_pct"] < 0 else "UP"
     return (
@@ -127,14 +132,71 @@ def format_alert(ticker: str, q: dict) -> str:
     )
 
 
+def build_spx_history(ticker: str, cache: dict, max_days: int = 10) -> List[dict]:
+    """
+    Build a list of {date, close, prev_close, change_pct} records covering the
+    most recent trading days, using cached history + new quote data.
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    # Start with any cached history for this ticker
+    history = list(cache.get(f"{ticker}_history", []))
+
+    q = fetch_quote(ticker)
+    if q is None:
+        return history
+
+    # Build today's record (use today's date; Yahoo's prev_close is already the
+    # immediately preceding trading day's close)
+    today_record = {
+        "date":        today_str,
+        "close":       q["price"],
+        "prev_close":  q["prev_close"],
+        "change_pct": q["change_pct"],
+    }
+
+    # Avoid duplicate date entries — replace today's entry if it already exists
+    if history and history[-1]["date"] == today_str:
+        history[-1] = today_record
+    else:
+        history.append(today_record)
+
+    # Keep only the most recent max_days records
+    history = history[-max_days:]
+
+    # Update cache
+    cache[f"{ticker}_history"] = history
+    cache[ticker] = {
+        "price":      q["price"],
+        "prev_close": q["prev_close"],
+        "date":       today_str,
+    }
+
+    return history
+
+
+def check_spx_consecutive_downs(history: List[dict], required: int = 3) -> Tuple[bool, List[dict]]:
+    """
+    Return (triggered, relevant_records) where triggered is True if the last
+    `required` entries in history are all down days.
+    """
+    if len(history) < required:
+        return False, []
+    recent = history[-required:]
+    triggered = all(r["change_pct"] < 0 for r in recent)
+    return triggered, recent
+
+
 def main():
     print(f"[{datetime.now().isoformat()}] Stock alert check starting...")
 
     today_str = datetime.now().strftime("%Y-%m-%d")
     cache     = load_cache()
-    alerts    = []
+    alerts_5pct   = []
+    alert_spx_down = None
 
-    for ticker in TICKERS:
+    # ── 5% alerts for TICKERS_5PCT ────────────────────────────────────────
+    for ticker in TICKERS_5PCT:
         q = fetch_quote(ticker)
         if q is None:
             print(f"  {ticker}: fetch failed -- skipping")
@@ -142,36 +204,67 @@ def main():
 
         print(f"  {ticker}: price=${q['price']:.2f}, prev=${q['prev_close']:.2f}, chg={q['change_pct']:+.2f}%")
 
-        # Always cache today's data for next-run comparison baseline
         cache[ticker] = {
             "price":      q["price"],
             "prev_close": q["prev_close"],
             "date":       today_str,
         }
 
-        abs_chg = abs(q["change_pct"])
-        if abs_chg >= THRESHOLD:
-            alerts.append((ticker, q))
+        if abs(q["change_pct"]) >= THRESHOLD:
+            alerts_5pct.append((ticker, q))
 
-    # Persist cache
+    # ── S&P 500 consecutive down days ───────────────────────────────────────
+    print(f"\n  Building SPX history...")
+    spx_history = build_spx_history(SPX_TICKER, cache)
+
+    # Print recent history for visibility
+    for r in spx_history:
+        print(f"    {r['date']}: {r['change_pct']:+.2f}%")
+
+    triggered, down_records = check_spx_consecutive_downs(spx_history, SPX_CONSECUTIVE_DOWNS)
+    if triggered:
+        # Include the full down-day streak in the alert
+        alert_spx_down = list(down_records)
+        print(f"\n  SPX: {SPX_CONSECUTIVE_DOWNS} consecutive down days TRIGGERED")
+    else:
+        print(f"\n  SPX: {len(spx_history)} days tracked, no alert (need {SPX_CONSECUTIVE_DOWNS} consecutive)")
+
+    # Always persist cache after SPX processing
     save_cache(cache)
 
-    # Build & send Telegram message
-    if alerts:
-        lines = [f"Stock Alert -- {today_str}\n(threshold: ±{THRESHOLD}%)\n"]
-        lines += [format_alert(t, q) for t, q in alerts]
-        message = "\n".join(lines)
+    # ── Build & send Telegram message ────────────────────────────────────
+    all_lines = []
 
-        if "YOUR_BOT_TOKEN" in TELEGRAM_BOT_TOKEN:
-            print("\n[TG DEMO -- set TELEGRAM_BOT_TOKEN to send real alerts]")
+    if alerts_5pct:
+        all_lines.append(f"<b>Stock Alert -- {today_str}</b> (threshold: ±{THRESHOLD}%)\n")
+        all_lines += [format_5pct_alert(t, q) for t, q in alerts_5pct]
+        all_lines.append("")
+
+    if alert_spx_down is not None:
+        streak = alert_spx_down
+        total_chg = sum(r["change_pct"] for r in streak)
+        first_price = streak[0]["prev_close"]
+        last_price  = streak[-1]["close"]
+        spx_title = f"<b>S&amp;P 500 Alert -- {SPX_CONSECUTIVE_DOWNS} Consecutive Down Days</b>"
+        streak_str = ", ".join(f"{r['change_pct']:+.2f}%" for r in streak)
+        all_lines.append(
+            f"{spx_title}\n"
+            f"   🔴 {SPX_CONSECUTIVE_DOWNS} straight days of losses: {streak_str}\n"
+            f"   Cumulative drop: {total_chg:.2f}% (${first_price:.2f} → ${last_price:.2f})"
+        )
+        all_lines.append("")
+
+    if all_lines:
+        message = "\n".join(all_lines).strip()
+
+        if get_telegram_safe_mode():
+            print("\n[SKIP] Telegram send blocked in safe-exec context")
             print(message)
-        elif get_telegram_safe_mode():
-            print("[SKIP] Telegram send blocked in safe-exec context")
         else:
             ok = send_telegram(message)
-            print(f"  Telegram sent: {'OK' if ok else 'FAILED'}")
+            print(f"\n  Telegram sent: {'OK' if ok else 'FAILED'}")
     else:
-        print("  No alerts triggered.")
+        print("\n  No alerts triggered.")
 
 
 if __name__ == "__main__":
